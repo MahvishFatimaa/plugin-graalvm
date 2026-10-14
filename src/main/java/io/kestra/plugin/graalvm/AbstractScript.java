@@ -11,6 +11,7 @@ import lombok.experimental.SuperBuilder;
 import org.graalvm.polyglot.*;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.IOAccess;
+import org.graalvm.polyglot.io.FileSystem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -141,7 +142,7 @@ abstract class AbstractScript extends Task {
             .allowCreateProcess(false)
             // also overrides the IOAccess set by GraalPyResources.contextBuilder()
             .allowIO(IOAccess.newBuilder()
-                .fileSystem(WorkingDirFileSystem.create(runContext.workingDir().path()))
+                .fileSystem(fileSystem(runContext))
                 .allowHostSocketAccess(true)
                 .build()
             )
@@ -155,6 +156,10 @@ abstract class AbstractScript extends Task {
         });
 
         return builder.build();
+    }
+
+    protected FileSystem fileSystem(RunContext runContext) throws IOException {
+        return WorkingDirFileSystem.create(runContext.workingDir().path());
     }
 
     private static boolean isHostClassLookupAllowed(String name) {

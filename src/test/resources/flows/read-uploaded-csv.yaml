@@ -1,0 +1,21 @@
+id: read_uploaded_csv
+namespace: company.team
+
+inputs:
+  - id: csv_file
+    type: FILE
+
+tasks:
+  - id: process_csv
+    type: io.kestra.plugin.graalvm.python.Eval
+    outputs:
+      - row_count
+      - total
+    script: |
+      import csv
+      with open('{{ inputs.csv_file }}', 'r') as csvfile:
+          rows = list(csv.DictReader(csvfile))
+      row_count = len(rows)
+      total = sum(int(row['score']) for row in rows)
+      logger.info('Read {} rows with total {}'.format(row_count, total))
+      {"row_count": row_count, "total": total}

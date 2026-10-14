@@ -24,6 +24,24 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
 class EvalTest {
+    @Test
+    void preservesOpaqueInternalStorageUri() throws Exception {
+        String uri = "kestra:///" + java.util.UUID.randomUUID() + ".csv";
+        RunContext runContext = runContextFactory.of(Map.of("inputs", Map.of("uri", uri)));
+        Eval task = Eval.builder()
+            .id(java.util.UUID.randomUUID().toString())
+            .type(Eval.class.getName())
+            .script(Property.ofExpression("({uri: '{{ inputs.uri }}'})"))
+            .outputs(Property.ofValue(List.of("uri")))
+            .build();
+
+        try {
+            assertThat(task.run(runContext).getOutputs().get("uri"), is(uri));
+        } finally {
+            runContext.cleanup();
+        }
+    }
+
     @Inject
     private RunContextFactory runContextFactory;
 

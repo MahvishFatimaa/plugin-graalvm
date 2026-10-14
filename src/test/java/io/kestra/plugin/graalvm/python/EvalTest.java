@@ -2,6 +2,8 @@ package io.kestra.plugin.graalvm.python;
 
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
+import io.kestra.core.models.flows.Flow;
+import io.kestra.core.serializers.YamlParser;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.plugin.graalvm.ForkedJvm;
@@ -11,9 +13,11 @@ import org.graalvm.polyglot.PolyglotException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -26,6 +30,116 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @KestraTest
 class EvalTest {
+    @Test
+    void uploadedCsvExampleReturnsDeclaredOutputsAfterLogging() throws Exception {
+        Flow flow;
+        try (var yaml = getClass().getResourceAsStream("/flows/read-uploaded-csv.yaml")) {
+            flow = YamlParser.parse(new String(yaml.readAllBytes(), StandardCharsets.UTF_8), Flow.class);
+        }
+        RunContext uploadContext = runContextFactory.of();
+        URI uploaded = uploadContext.storage().putFile(
+            new ByteArrayInputStream("name,score\nAda,42\nGrace,99\n".getBytes(StandardCharsets.UTF_8)),
+            UUID.randomUUID() + ".csv"
+        );
+        RunContext runContext = runContextFactory.of(Map.of("inputs", Map.of("csv_file", uploaded.toString())));
+        try {
+            var output = ((Eval) flow.getTasks().getFirst()).run(runContext);
+            assertThat(output.getOutputs().get("row_count"), is(2));
+            assertThat(output.getOutputs().get("total"), is(141));
+        } finally {
+            runContext.cleanup();
+        }
+    }
+
+    @Test
+    void shouldReadUploadedCsvFromRenderedInput() throws Exception {
+        RunContext uploadContext = runContextFactory.of();
+        URI uploaded = uploadContext.storage().putFile(
+            new ByteArrayInputStream("name,score\nAda,42\nGrace,99\n".getBytes(StandardCharsets.UTF_8)),
+            UUID.randomUUID() + ".csv"
+        );
+        RunContext runContext = runContextFactory.of(Map.of("inputs", Map.of("csv_file", uploaded.toString())));
+        Eval task = Eval.builder()
+            .id(UUID.randomUUID().toString())
+            .type(Eval.class.getName())
+            .script(Property.ofExpression("""
+                import csv
+                import os
+                path = '{{ inputs.csv_file }}'
+                second_path = '{{ inputs.csv_file }}'
+                with open(second_path, 'r') as second_file:
+                    duplicate_content = second_file.read()
+                with open(path, 'r') as csvfile:
+                    rows = list(csv.DictReader(csvfile))
+                names = ', '.join(row['name'] for row in rows)
+                duplicate_matches = duplicate_content == 'name,score\\nAda,42\\nGrace,99\\n'
+                total = sum(int(row['score']) for row in rows)
+                uri_unchanged = path == inputs['csv_file']
+                file_size = os.stat(path).st_size
+                """))
+            .outputs(Property.ofValue(List.of("names", "total", "uri_unchanged", "duplicate_matches", "file_size")))
+            .build();
+
+        Path workingDirectory = runContext.workingDir().path();
+        try {
+            var output = task.run(runContext);
+            assertThat(output.getOutputs().get("names"), is("Ada, Grace"));
+            assertThat(output.getOutputs().get("total"), is(141));
+            assertThat(output.getOutputs().get("uri_unchanged"), is(true));
+            assertThat(output.getOutputs().get("file_size"), is(27));
+            try (var files = Files.list(workingDirectory)) {
+                var staged = files.toList();
+                assertThat(staged.size(), is(1));
+                assertThat(staged.getFirst().toRealPath().getParent(), is(workingDirectory.toRealPath()));
+            }
+            assertThat(output.getOutputs().get("duplicate_matches"), is(true));
+        } finally {
+            runContext.cleanup();
+        }
+        assertThat(Files.exists(workingDirectory), is(false));
+        try (var original = uploadContext.storage().getFile(uploaded)) {
+            assertThat(new String(original.readAllBytes(), StandardCharsets.UTF_8), is("name,score\nAda,42\nGrace,99\n"));
+        }
+    }
+
+    @Test
+    void preservesOpaqueStorageUriAccessedThroughBindings() throws Exception {
+        String uri = "kestra:///" + UUID.randomUUID() + ".csv";
+        RunContext runContext = runContextFactory.of(Map.of("inputs", Map.of("csv_file", uri)));
+        Eval task = Eval.builder()
+            .id(UUID.randomUUID().toString())
+            .type(Eval.class.getName())
+            .script(Property.ofValue("uri = inputs['csv_file']"))
+            .outputs(Property.ofValue(List.of("uri")))
+            .build();
+
+        try {
+            assertThat(task.run(runContext).getOutputs().get("uri"), is(uri));
+        } finally {
+            runContext.cleanup();
+        }
+    }
+
+    @Test
+    void shouldFailWhenReferencedStorageFileDoesNotExist() {
+        RunContext runContext = runContextFactory.of(Map.of("inputs", Map.of("csv_file", "kestra:///" + UUID.randomUUID() + ".csv")));
+        Eval task = Eval.builder()
+            .id(UUID.randomUUID().toString())
+            .type(Eval.class.getName())
+            .script(Property.ofExpression("open('{{ inputs.csv_file }}').read()"))
+            .build();
+
+        Path workingDirectory = runContext.workingDir().path();
+        try {
+            var failure = assertThrows(PolyglotException.class, () -> task.run(runContext));
+            assertThat(failure.isGuestException(), is(true));
+            assertThat(failure.getMessage(), containsString("FileNotFoundError"));
+        } finally {
+            runContext.cleanup();
+        }
+        assertThat(Files.exists(workingDirectory), is(false));
+    }
+
     // The issue's own repro script: these modules extract native/platform resources from the Python
     // stdlib and used to fail once the GraalPy user resource cache (~/.cache/org.graalvm.polyglot)
     // was unwritable, wiped, or corrupted (kestra-io/plugin-graalvm#40).

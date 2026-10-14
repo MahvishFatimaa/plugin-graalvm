@@ -14,8 +14,11 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.io.FileSystem;
+import io.kestra.plugin.graalvm.WorkingDirFileSystem;
 import org.graalvm.python.embedding.GraalPyResources;
 
+import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +38,30 @@ import static io.kestra.core.utils.Rethrow.throwBiConsumer;
 )
 @Plugin(
     examples = {
+        @Example(
+            full = true,
+            title = "Read an uploaded CSV file with Python.",
+            code = """
+                id: read_uploaded_csv
+                namespace: company.team
+
+                inputs:
+                  - id: csv_file
+                    type: FILE
+
+                tasks:
+                  - id: process_csv
+                    type: io.kestra.plugin.graalvm.python.Eval
+                    outputs:
+                      - row_count
+                    script: |
+                      import csv
+                      with open('{{ inputs.csv_file }}', 'r') as csvfile:
+                          row_count = sum(1 for row in csv.DictReader(csvfile))
+                      logger.info('Read {} rows'.format(row_count))
+                      {"row_count": row_count}
+                """
+        ),
         @Example(
             full = true,
             title = "Parse a downloaded JSON and update one of its fields.",
@@ -119,6 +146,10 @@ public class Eval extends AbstractEval {
     @PluginProperty(group = "advanced")
     private Property<Map<String, String>> modules;
 
+    @Schema(
+        title = "Python script body to execute",
+        description = "Template-rendered Python source. Python file operations can open `kestra://` URIs, including uploaded FILE inputs. Access stages a local copy in the task working directory; repeated accesses in the same task use that copy, and local changes do not update internal storage. URI strings and comments are unchanged. Staged files are removed with the task working directory."
+    )
     @PluginProperty(language = MonacoLanguages.PYTHON)
     @Override
     public Property<String> getScript() {
@@ -152,6 +183,11 @@ public class Eval extends AbstractEval {
         }
 
         return this.run(runContext, "python");
+    }
+
+    @Override
+    protected FileSystem fileSystem(RunContext runContext) throws IOException {
+        return WorkingDirFileSystem.create(runContext.workingDir().path(), runContext.storage());
     }
 
     @Override

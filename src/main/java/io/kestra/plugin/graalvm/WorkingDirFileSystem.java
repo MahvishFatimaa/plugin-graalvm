@@ -1,10 +1,13 @@
 package io.kestra.plugin.graalvm;
 
 import org.graalvm.polyglot.io.FileSystem;
+import io.kestra.core.storages.Storage;
 
 import java.io.IOException;
+import java.io.FileNotFoundException;
 import java.net.URI;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.channels.Channels;
 import java.nio.charset.Charset;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -13,6 +16,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.UUID;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -26,12 +31,20 @@ public final class WorkingDirFileSystem implements FileSystem {
 
     private final FileSystem delegate = FileSystem.newDefaultFileSystem();
     private final Path root;
+    private final Storage storage;
+    private final Map<URI, Path> storagePaths = new HashMap<>();
+    private final Map<Path, URI> pendingDownloads = new HashMap<>();
     // paths visited to resolve the working dir as given, which may go through host symlinks such as
     // /var -> /private/var on macOS; chosen by the host, not the script, so probing them reveals nothing
     private final Set<Path> pathsToRoot = new HashSet<>();
     private volatile Path currentWorkingDirectory;
 
     WorkingDirFileSystem(Path workingDirectory) throws IOException {
+        this(workingDirectory, null);
+    }
+
+    private WorkingDirFileSystem(Path workingDirectory, Storage storage) throws IOException {
+        this.storage = storage;
         this.root = workingDirectory.toRealPath();
         for (var ancestor = root; ancestor != null; ancestor = ancestor.getParent()) {
             pathsToRoot.add(ancestor);
@@ -44,7 +57,12 @@ public final class WorkingDirFileSystem implements FileSystem {
     // so scripts can read it but never write to it. Paths outside the working dir and the paths leading to it
     // go to a read-only view of the internal resources (anything else is denied by GraalVM).
     public static FileSystem create(Path workingDirectory) throws IOException {
-        var workingDir = new WorkingDirFileSystem(workingDirectory);
+        return create(workingDirectory, null);
+    }
+
+    /** Creates a task-local filesystem that stages internal-storage URIs when accessed. */
+    public static FileSystem create(Path workingDirectory, Storage storage) throws IOException {
+        var workingDir = new WorkingDirFileSystem(workingDirectory, storage);
         var internalResources = new ReadOnlyInternalResources(
             FileSystem.newReadOnlyFileSystem(FileSystem.allowInternalResourceAccess(FileSystem.newDenyIOFileSystem())),
             workingDir
@@ -82,12 +100,48 @@ public final class WorkingDirFileSystem implements FileSystem {
 
     @Override
     public Path parsePath(URI uri) {
-        return delegate.parsePath(uri);
+        return storage != null && "kestra".equals(uri.getScheme()) ? storagePath(uri) : delegate.parsePath(uri);
     }
 
     @Override
     public Path parsePath(String path) {
-        return delegate.parsePath(path);
+        return storage != null && path.startsWith("kestra://") ? storagePath(URI.create(path)) : delegate.parsePath(path);
+    }
+
+    private synchronized Path storagePath(URI uri) {
+        return storagePaths.computeIfAbsent(uri, key -> {
+            var path = root.resolve(UUID.randomUUID() + ".tmp");
+            pendingDownloads.put(path, key);
+            return path;
+        });
+    }
+
+    private synchronized void stageStorageFile(Path path) throws IOException {
+        var uri = pendingDownloads.get(path);
+        if (uri == null) {
+            return;
+        }
+        boolean created = false;
+        try (var source = storage.getFile(uri)) {
+            try (var output = Channels.newOutputStream(delegate.newByteChannel(path,
+                Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)))) {
+                created = true;
+                source.transferTo(output);
+            }
+        } catch (IOException | RuntimeException e) {
+            if (created) {
+                try {
+                    delegate.delete(path);
+                } catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
+            if (e instanceof FileNotFoundException) {
+                throw new NoSuchFileException(uri.toString(), null, e.getMessage());
+            }
+            throw e;
+        }
+        pendingDownloads.remove(path);
     }
 
     @Override
@@ -250,6 +304,9 @@ public final class WorkingDirFileSystem implements FileSystem {
         });
         if (!resolved.startsWith(root)) {
             throw deny(original);
+        }
+        if (storage != null) {
+            stageStorageFile(resolved);
         }
         return resolved;
     }
